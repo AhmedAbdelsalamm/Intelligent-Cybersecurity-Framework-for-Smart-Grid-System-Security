@@ -1,0 +1,679 @@
+#!/usr/bin/env python3
+# ========== SMART GRID CYBER ATTACK DETECTION SYSTEM ==========
+# COMPREHENSIVE ATTACK DETECTION FOR SMART GRID PROTECTION
+
+import socket
+import time
+import threading
+import os
+from datetime import datetime
+import sys
+import subprocess
+from collections import defaultdict
+
+# ===== CONFIGURATION =====
+ARDUINO_IP = "192.168.1.200"
+ARDUINO_PORT = 5006
+
+GRID_IPS = {
+    "GRID1": "192.168.1.10",
+    "GRID2": "192.168.1.20"
+}
+
+# Smart Grid Ports
+GRID_PORTS = {
+    502,    # MODBUS (Common in SCADA/Grid)
+    2404,   # IEC 60870-5-104 (Power systems)
+    44818,  # EtherNet/IP (Industrial)
+    20000,  # DNP3 (Grid control)
+    47808,  # BACnet (Building automation in substations)
+    1911,   # Fox (Siemens grid protocol)
+    102,    # S7comm (Siemens industrial)
+}
+
+# Attack thresholds
+ICMP_FLOOD_THRESHOLD = 5            # 5 ICMP packets = flood
+SYN_FLOOD_THRESHOLD = 10           # 10 SYN packets
+UDP_FLOOD_THRESHOLD = 15           # 15 UDP packets
+PORT_SCAN_THRESHOLD = 5            # 5 different ports
+BRUTE_FORCE_THRESHOLD = 3          # 3 failed auth attempts
+GRID_PROTOCOL_ATTACK = 2           # 2 suspicious grid protocol packets
+DDOS_THRESHOLD = 20                # 20 packets from single source
+AUTO_RECOVERY_TIME = 10            # 10-second recovery
+
+# ===== GLOBAL VARIABLES =====
+system_state = "NORMAL"
+current_attack_target = None
+current_attack_type = None
+attack_start_time = 0
+
+# Attack counters per grid
+ping_counter_grid1 = 0
+ping_counter_grid2 = 0
+syn_counter_grid1 = defaultdict(int)
+syn_counter_grid2 = defaultdict(int)
+udp_counter_grid1 = defaultdict(int)
+udp_counter_grid2 = defaultdict(int)
+port_scan_grid1 = defaultdict(set)
+port_scan_grid2 = defaultdict(set)
+failed_auth_grid1 = defaultdict(int)
+failed_auth_grid2 = defaultdict(int)
+suspicious_protocol_grid1 = 0
+suspicious_protocol_grid2 = 0
+ddos_counter_grid1 = defaultdict(int)
+ddos_counter_grid2 = defaultdict(int)
+
+# TSHARK process
+tshark_process = None
+
+# ===== TSHARK MANAGEMENT =====
+def start_tshark_auto():
+    global tshark_process
+    
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting TSHARK for Smart Grid monitoring...")
+    
+    tshark_cmd = [
+        'sudo', 'tshark',
+        '-i', 'eth0',
+        '-T', 'fields',
+        '-e', '_ws.col.Protocol',
+        '-e', 'ip.src',
+        '-e', 'ip.dst',
+        '-e', 'tcp.srcport',
+        '-e', 'tcp.dstport',
+        '-e', 'tcp.flags',
+        '-e', 'icmp.type',
+        '-e', 'udp.srcport',
+        '-e', 'udp.dstport',
+        '-e', 'tcp.flags.syn',
+        '-e', 'tcp.flags.ack',
+        '-e', 'tcp.flags.reset',
+        '-e', 'frame.len',
+        '-E', 'separator=|',
+        '-l'
+    ]
+    
+    try:
+        tshark_process = subprocess.Popen(
+            tshark_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] TSHARK STARTED ✓ Monitoring Smart Grid traffic...")
+        return True
+    except Exception as e:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] ERROR starting tshark: {e}")
+        return False
+
+def stop_tshark():
+    global tshark_process
+    if tshark_process:
+        tshark_process.terminate()
+        tshark_process = None
+
+# ===== ARDUINO COMMUNICATION =====
+def send_to_arduino(command):
+    try:
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        print(f"[{timestamp}] Sending to Arduino: '{command}'")
+        
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        sock.connect((ARDUINO_IP, ARDUINO_PORT))
+        sock.sendall(command.encode())
+        
+        response = sock.recv(1024).decode().strip()
+        sock.close()
+        
+        print(f"[{timestamp}] Arduino response: {response}")
+        return True
+        
+    except Exception as e:
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        print(f"[{timestamp}] ERROR sending to Arduino: {e}")
+        return False
+
+def set_normal_mode():
+    global system_state, attack_start_time, current_attack_type
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    print(f"\n" + "="*60)
+    print(f"[{timestamp}] === NORMAL MODE ACTIVATED ===")
+    print("Command: 'N' → Fans: ON | Alarms: OFF")
+    print("="*60)
+    
+    if send_to_arduino('N'):
+        system_state = "NORMAL"
+        attack_start_time = 0
+        current_attack_type = None
+        return True
+    return False
+
+def set_attack_mode(target=None, attack_type="CYBER ATTACK"):
+    global system_state, current_attack_target, attack_start_time, current_attack_type
+    
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    print(f"\n" + "!"*60)
+    print(f"[{timestamp}] === SMART GRID ATTACK DETECTED ===")
+    print(f"Attack Type: {attack_type}")
+    print(f"Severity: CRITICAL")
+    
+    if target == "GRID1":
+        command = 'A1'
+        print(f"Target: {target} (Grid 1 only)")
+        current_attack_target = target
+    elif target == "GRID2":
+        command = 'A2'
+        print(f"Target: {target} (Grid 2 only)")
+        current_attack_target = target
+    elif target:
+        command = 'A'
+        print(f"Target: {target}")
+        current_attack_target = target
+    else:
+        command = 'A'
+        print("Target: ALL GRIDS - GRID WIDE ATTACK")
+        current_attack_target = "ALL"
+    
+    current_attack_type = attack_type
+    print(f"Command: '{command}' → Emergency Grid Isolation")
+    print("Response: Fans OFF | Alarms ON | System ISOLATED")
+    print(f"Auto-recovery in {AUTO_RECOVERY_TIME} seconds")
+    print("!"*60)
+    
+    if send_to_arduino(command):
+        system_state = "ATTACK"
+        attack_start_time = time.time()
+        return True
+    return False
+
+def set_standby_mode():
+    global system_state, attack_start_time, current_attack_type
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    print(f"\n" + "="*60)
+    print(f"[{timestamp}] === STANDBY MODE ACTIVATED ===")
+    print("Command: 'F' → Fans: OFF | Alarms: OFF")
+    print("="*60)
+    
+    if send_to_arduino('F'):
+        system_state = "STANDBY"
+        attack_start_time = 0
+        current_attack_type = None
+        return True
+    return False
+
+# ===== PACKET PROCESSING =====
+def monitor_network():
+    global ping_counter_grid1, ping_counter_grid2
+    
+    if not start_tshark_auto():
+        print("[ERROR] Could not start tshark.")
+        return
+    
+    try:
+        for line in tshark_process.stdout:
+            line = line.strip()
+            if line:
+                process_packet_line(line)
+                
+            check_all_attacks()
+            handle_auto_recovery()
+                
+    except Exception as e:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: {e}")
+    finally:
+        stop_tshark()
+
+def process_packet_line(line):
+    global ping_counter_grid1, ping_counter_grid2
+    global suspicious_protocol_grid1, suspicious_protocol_grid2
+    
+    try:
+        parts = line.split('|')
+        if len(parts) >= 8:
+            protocol = parts[0].upper() if parts[0] else ""
+            src_ip = parts[1]
+            dst_ip = parts[2]
+            tcp_src_port = parts[3] if len(parts) > 3 else ""
+            tcp_dst_port = parts[4] if len(parts) > 4 else ""
+            tcp_flags = parts[5] if len(parts) > 5 else ""
+            icmp_type = parts[6] if len(parts) > 6 else ""
+            udp_src_port = parts[7] if len(parts) > 7 else ""
+            udp_dst_port = parts[8] if len(parts) > 8 else ""
+            
+            if dst_ip in GRID_IPS.values():
+                grid_name = get_grid_name(dst_ip)
+                
+                # 1. ICMP FLOOD DETECTION (Ping Attack)
+                if protocol == "ICMP" and icmp_type == "8":
+                    if grid_name == "GRID1":
+                        ping_counter_grid1 += 1
+                        if ping_counter_grid1 % 2 == 0:
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] ICMP to Grid 1: {ping_counter_grid1}")
+                    elif grid_name == "GRID2":
+                        ping_counter_grid2 += 1
+                        if ping_counter_grid2 % 2 == 0:
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] ICMP to Grid 2: {ping_counter_grid2}")
+                
+                # 2. SYN FLOOD DETECTION (TCP Half-open attack)
+                elif protocol == "TCP" and "S" in tcp_flags and "A" not in tcp_flags:
+                    if grid_name == "GRID1":
+                        syn_counter_grid1[src_ip] += 1
+                        if syn_counter_grid1[src_ip] % 3 == 0:
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] SYN Flood to Grid 1 from {src_ip}: {syn_counter_grid1[src_ip]}")
+                    elif grid_name == "GRID2":
+                        syn_counter_grid2[src_ip] += 1
+                        if syn_counter_grid2[src_ip] % 3 == 0:
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] SYN Flood to Grid 2 from {src_ip}: {syn_counter_grid2[src_ip]}")
+                
+                # 3. UDP FLOOD DETECTION
+                elif protocol == "UDP" and udp_dst_port:
+                    if grid_name == "GRID1":
+                        udp_counter_grid1[src_ip] += 1
+                        if udp_counter_grid1[src_ip] % 5 == 0:
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] UDP Flood to Grid 1 from {src_ip}: {udp_counter_grid1[src_ip]}")
+                    elif grid_name == "GRID2":
+                        udp_counter_grid2[src_ip] += 1
+                        if udp_counter_grid2[src_ip] % 5 == 0:
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] UDP Flood to Grid 2 from {src_ip}: {udp_counter_grid2[src_ip]}")
+                
+                # 4. PORT SCAN DETECTION (Reconnaissance)
+                elif protocol == "TCP" and tcp_dst_port and tcp_dst_port != "5005":
+                    if grid_name == "GRID1":
+                        port_scan_grid1[src_ip].add(tcp_dst_port)
+                        if len(port_scan_grid1[src_ip]) % 2 == 0:
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] Port Scan to Grid 1 from {src_ip}: {len(port_scan_grid1[src_ip])} ports")
+                    elif grid_name == "GRID2":
+                        port_scan_grid2[src_ip].add(tcp_dst_port)
+                        if len(port_scan_grid2[src_ip]) % 2 == 0:
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] Port Scan to Grid 2 from {src_ip}: {len(port_scan_grid2[src_ip])} ports")
+                
+                # 5. BRUTE FORCE ATTEMPT DETECTION (Failed authentication)
+                elif protocol == "TCP" and tcp_dst_port == "5005" and "R" in tcp_flags:
+                    if grid_name == "GRID1":
+                        failed_auth_grid1[src_ip] += 1
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Failed Auth to Grid 1 from {src_ip}: {failed_auth_grid1[src_ip]}")
+                    elif grid_name == "GRID2":
+                        failed_auth_grid2[src_ip] += 1
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Failed Auth to Grid 2 from {src_ip}: {failed_auth_grid2[src_ip]}")
+                
+                # 6. SMART GRID PROTOCOL ATTACK DETECTION (Targeted industrial protocols)
+                elif tcp_dst_port and int(tcp_dst_port) in GRID_PORTS:
+                    if grid_name == "GRID1":
+                        suspicious_protocol_grid1 += 1
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Grid Protocol Attack to Grid 1 on port {tcp_dst_port}: {suspicious_protocol_grid1}")
+                    elif grid_name == "GRID2":
+                        suspicious_protocol_grid2 += 1
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Grid Protocol Attack to Grid 2 on port {tcp_dst_port}: {suspicious_protocol_grid2}")
+                
+                # 7. DDoS ATTACK DETECTION (High volume from single source)
+                if grid_name == "GRID1":
+                    ddos_counter_grid1[src_ip] += 1
+                    if ddos_counter_grid1[src_ip] % 10 == 0:
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] DDoS to Grid 1 from {src_ip}: {ddos_counter_grid1[src_ip]} packets")
+                elif grid_name == "GRID2":
+                    ddos_counter_grid2[src_ip] += 1
+                    if ddos_counter_grid2[src_ip] % 10 == 0:
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] DDoS to Grid 2 from {src_ip}: {ddos_counter_grid2[src_ip]} packets")
+                        
+    except Exception as e:
+        pass
+
+# ===== COMPREHENSIVE ATTACK DETECTION =====
+def check_all_attacks():
+    global ping_counter_grid1, ping_counter_grid2
+    global suspicious_protocol_grid1, suspicious_protocol_grid2
+    
+    # 1. ICMP FLOOD ATTACK
+    if ping_counter_grid1 >= ICMP_FLOOD_THRESHOLD:
+        print_attack_alert("GRID1", "ICMP FLOOD ATTACK", 
+                          f"Pings to Grid 1: {ping_counter_grid1}", ICMP_FLOOD_THRESHOLD)
+        set_attack_mode("GRID1", "ICMP Flood Attack")
+        ping_counter_grid1 = 0
+        return
+    
+    if ping_counter_grid2 >= ICMP_FLOOD_THRESHOLD:
+        print_attack_alert("GRID2", "ICMP FLOOD ATTACK", 
+                          f"Pings to Grid 2: {ping_counter_grid2}", ICMP_FLOOD_THRESHOLD)
+        set_attack_mode("GRID2", "ICMP Flood Attack")
+        ping_counter_grid2 = 0
+        return
+    
+    # 2. SYN FLOOD ATTACK
+    for src_ip, count in list(syn_counter_grid1.items()):
+        if count >= SYN_FLOOD_THRESHOLD:
+            print_attack_alert("GRID1", "SYN FLOOD ATTACK", 
+                              f"SYN packets from {src_ip}: {count}", SYN_FLOOD_THRESHOLD)
+            set_attack_mode("GRID1", "SYN Flood Attack")
+            syn_counter_grid1[src_ip] = 0
+            return
+    
+    for src_ip, count in list(syn_counter_grid2.items()):
+        if count >= SYN_FLOOD_THRESHOLD:
+            print_attack_alert("GRID2", "SYN FLOOD ATTACK", 
+                              f"SYN packets from {src_ip}: {count}", SYN_FLOOD_THRESHOLD)
+            set_attack_mode("GRID2", "SYN Flood Attack")
+            syn_counter_grid2[src_ip] = 0
+            return
+    
+    # 3. UDP FLOOD ATTACK
+    for src_ip, count in list(udp_counter_grid1.items()):
+        if count >= UDP_FLOOD_THRESHOLD:
+            print_attack_alert("GRID1", "UDP FLOOD ATTACK", 
+                              f"UDP packets from {src_ip}: {count}", UDP_FLOOD_THRESHOLD)
+            set_attack_mode("GRID1", "UDP Flood Attack")
+            udp_counter_grid1[src_ip] = 0
+            return
+    
+    for src_ip, count in list(udp_counter_grid2.items()):
+        if count >= UDP_FLOOD_THRESHOLD:
+            print_attack_alert("GRID2", "UDP FLOOD ATTACK", 
+                              f"UDP packets from {src_ip}: {count}", UDP_FLOOD_THRESHOLD)
+            set_attack_mode("GRID2", "UDP Flood Attack")
+            udp_counter_grid2[src_ip] = 0
+            return
+    
+    # 4. PORT SCAN ATTACK (Reconnaissance)
+    for src_ip, ports in list(port_scan_grid1.items()):
+        if len(ports) >= PORT_SCAN_THRESHOLD:
+            print_attack_alert("GRID1", "PORT SCAN ATTACK", 
+                              f"Scanned ports from {src_ip}: {len(ports)}", PORT_SCAN_THRESHOLD)
+            set_attack_mode("GRID1", "Port Scan Attack")
+            port_scan_grid1[src_ip].clear()
+            return
+    
+    for src_ip, ports in list(port_scan_grid2.items()):
+        if len(ports) >= PORT_SCAN_THRESHOLD:
+            print_attack_alert("GRID2", "PORT SCAN ATTACK", 
+                              f"Scanned ports from {src_ip}: {len(ports)}", PORT_SCAN_THRESHOLD)
+            set_attack_mode("GRID2", "Port Scan Attack")
+            port_scan_grid2[src_ip].clear()
+            return
+    
+    # 5. BRUTE FORCE ATTACK
+    for src_ip, count in list(failed_auth_grid1.items()):
+        if count >= BRUTE_FORCE_THRESHOLD:
+            print_attack_alert("GRID1", "BRUTE FORCE ATTACK", 
+                              f"Failed auth from {src_ip}: {count}", BRUTE_FORCE_THRESHOLD)
+            set_attack_mode("GRID1", "Brute Force Attack")
+            failed_auth_grid1[src_ip] = 0
+            return
+    
+    for src_ip, count in list(failed_auth_grid2.items()):
+        if count >= BRUTE_FORCE_THRESHOLD:
+            print_attack_alert("GRID2", "BRUTE FORCE ATTACK", 
+                              f"Failed auth from {src_ip}: {count}", BRUTE_FORCE_THRESHOLD)
+            set_attack_mode("GRID2", "Brute Force Attack")
+            failed_auth_grid2[src_ip] = 0
+            return
+    
+    # 6. SMART GRID PROTOCOL ATTACK (Industrial Control System Attack)
+    if suspicious_protocol_grid1 >= GRID_PROTOCOL_ATTACK:
+        print_attack_alert("GRID1", "INDUSTRIAL PROTOCOL ATTACK", 
+                          f"Suspicious protocol packets: {suspicious_protocol_grid1}", GRID_PROTOCOL_ATTACK)
+        set_attack_mode("GRID1", "Industrial Protocol Attack")
+        suspicious_protocol_grid1 = 0
+        return
+    
+    if suspicious_protocol_grid2 >= GRID_PROTOCOL_ATTACK:
+        print_attack_alert("GRID2", "INDUSTRIAL PROTOCOL ATTACK", 
+                          f"Suspicious protocol packets: {suspicious_protocol_grid2}", GRID_PROTOCOL_ATTACK)
+        set_attack_mode("GRID2", "Industrial Protocol Attack")
+        suspicious_protocol_grid2 = 0
+        return
+    
+    # 7. DDoS ATTACK
+    for src_ip, count in list(ddos_counter_grid1.items()):
+        if count >= DDOS_THRESHOLD:
+            print_attack_alert("GRID1", "DDoS ATTACK", 
+                              f"Packets from {src_ip}: {count}", DDOS_THRESHOLD)
+            set_attack_mode("GRID1", "DDoS Attack")
+            ddos_counter_grid1[src_ip] = 0
+            return
+    
+    for src_ip, count in list(ddos_counter_grid2.items()):
+        if count >= DDOS_THRESHOLD:
+            print_attack_alert("GRID2", "DDoS ATTACK", 
+                              f"Packets from {src_ip}: {count}", DDOS_THRESHOLD)
+            set_attack_mode("GRID2", "DDoS Attack")
+            ddos_counter_grid2[src_ip] = 0
+            return
+
+def print_attack_alert(grid, attack_type, details, threshold):
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    print(f"\n" + "!"*60)
+    print(f"[{timestamp}] !!! SMART GRID CYBER ATTACK DETECTED !!!")
+    print(f"Target Grid: {grid}")
+    print(f"Attack Type: {attack_type}")
+    print(f"Details: {details}")
+    print(f"Threshold: {threshold}")
+    print(f"Response: ISOLATING {grid} - Activating Physical Protection")
+    print("!"*60)
+
+def get_grid_name(ip):
+    for name, grid_ip in GRID_IPS.items():
+        if grid_ip == ip:
+            return name
+    return ip
+
+def handle_auto_recovery():
+    global system_state, attack_start_time
+    
+    if system_state == "ATTACK" and attack_start_time > 0:
+        elapsed = time.time() - attack_start_time
+        remaining = AUTO_RECOVERY_TIME - elapsed
+        
+        if remaining > 0:
+            if remaining <= 5:
+                timestamp = datetime.now().strftime('%H:%M:%S')
+                print(f"[{timestamp}] Auto recovery in {int(remaining)}s")
+        else:
+            timestamp = datetime.now().strftime('%H:%M:%S')
+            print(f"\n[{timestamp}] Auto-recovery: Returning to NORMAL mode")
+            print(f"Attack Type: {current_attack_type}")
+            set_normal_mode()
+
+# ===== MAIN MENU =====
+def main_menu():
+    print("\n" + "="*80)
+    print("        SMART GRID CYBER ATTACK DETECTION SYSTEM")
+    print("="*80)
+    print(f"System State: {system_state}")
+    if current_attack_type:
+        print(f"Last Attack: {current_attack_type}")
+    
+    print("\n" + "-"*80)
+    print("DETECTED ATTACK TYPES:")
+    print(" 1. ICMP Flood Attack        - Denial of Service")
+    print(" 2. SYN Flood Attack         - TCP Half-open attack")
+    print(" 3. UDP Flood Attack         - Bandwidth exhaustion")
+    print(" 4. Port Scan Attack         - Reconnaissance")
+    print(" 5. Brute Force Attack       - Authentication cracking")
+    print(" 6. Industrial Protocol Attk - Targeted SCADA/Grid protocols")
+    print(" 7. DDoS Attack              - Distributed Denial of Service")
+    print("-"*80)
+    
+    print("\nCOMMANDS:")
+    print("  1. Start Attack Detection (Auto-starts tshark)")
+    print("  2. Manual: NORMAL mode (Fans ON, Alarms OFF)")
+    print("  3. Manual: STANDBY mode (Fans OFF, Alarms OFF)")
+    print("  4. Manual: ATTACK mode (Simulate attack)")
+    print("  5. System Status")
+    print("  6. Test All Attack Types")
+    print("  7. Exit")
+    print("="*80)
+    
+    while True:
+        try:
+            choice = input("\nSelect (1-7): ").strip()
+            
+            if choice == '1':
+                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Starting Smart Grid protection...")
+                monitor_thread = threading.Thread(target=monitor_network, daemon=True)
+                monitor_thread.start()
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] AI Monitoring ACTIVE - Protecting Smart Grid")
+                input("Press Enter to return to menu...")
+                
+            elif choice == '2':
+                set_normal_mode()
+                
+            elif choice == '3':
+                set_standby_mode()
+                
+            elif choice == '4':
+                print("\nSelect attack simulation:")
+                print("1. ICMP Flood Attack")
+                print("2. SYN Flood Attack")
+                print("3. UDP Flood Attack")
+                print("4. Port Scan Attack")
+                print("5. Brute Force Attack")
+                print("6. Industrial Protocol Attack")
+                print("7. DDoS Attack")
+                attack_choice = input("\nSelect attack type (1-7): ").strip()
+                
+                print("\nSelect target grid:")
+                print("1. Grid 1 only")
+                print("2. Grid 2 only")
+                print("3. Both grids")
+                target_choice = input("Select target (1-3): ").strip()
+                
+                if target_choice == '1':
+                    target = "GRID1"
+                elif target_choice == '2':
+                    target = "GRID2"
+                else:
+                    target = "ALL"
+                
+                attack_types = {
+                    '1': "ICMP Flood Attack",
+                    '2': "SYN Flood Attack",
+                    '3': "UDP Flood Attack",
+                    '4': "Port Scan Attack",
+                    '5': "Brute Force Attack",
+                    '6': "Industrial Protocol Attack",
+                    '7': "DDoS Attack"
+                }
+                
+                attack_type = attack_types.get(attack_choice, "Simulated Attack")
+                set_attack_mode(target, attack_type)
+                
+            elif choice == '5':
+                show_status()
+                
+            elif choice == '6':
+                test_all_attacks()
+                
+            elif choice == '7':
+                stop_tshark()
+                print("\nShutting down Smart Grid Protection System...")
+                sys.exit(0)
+                
+            else:
+                print("Invalid choice")
+                
+        except KeyboardInterrupt:
+            stop_tshark()
+            print("\nEmergency shutdown!")
+            sys.exit(0)
+
+def show_status():
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    print(f"\n[{timestamp}] === SMART GRID PROTECTION STATUS ===")
+    print(f"System State: {system_state}")
+    
+    if current_attack_target:
+        print(f"Last Attack Target: {current_attack_target}")
+    if current_attack_type:
+        print(f"Last Attack Type: {current_attack_type}")
+    
+    print(f"\nACTIVE THREATS MONITORING:")
+    print(f"  Grid 1 - ICMP: {ping_counter_grid1}/{ICMP_FLOOD_THRESHOLD}")
+    print(f"  Grid 2 - ICMP: {ping_counter_grid2}/{ICMP_FLOOD_THRESHOLD}")
+    
+    total_syn1 = sum(syn_counter_grid1.values())
+    total_syn2 = sum(syn_counter_grid2.values())
+    print(f"  Grid 1 - SYN Flood: {total_syn1}/{SYN_FLOOD_THRESHOLD}")
+    print(f"  Grid 2 - SYN Flood: {total_syn2}/{SYN_FLOOD_THRESHOLD}")
+    
+    total_ports1 = sum(len(ports) for ports in port_scan_grid1.values())
+    total_ports2 = sum(len(ports) for ports in port_scan_grid2.values())
+    print(f"  Grid 1 - Port Scan: {total_ports1}/{PORT_SCAN_THRESHOLD}")
+    print(f"  Grid 2 - Port Scan: {total_ports2}/{PORT_SCAN_THRESHOLD}")
+    
+    print(f"  Grid 1 - Grid Protocol: {suspicious_protocol_grid1}/{GRID_PROTOCOL_ATTACK}")
+    print(f"  Grid 2 - Grid Protocol: {suspicious_protocol_grid2}/{GRID_PROTOCOL_ATTACK}")
+    
+    if system_state == "ATTACK" and attack_start_time > 0:
+        elapsed = time.time() - attack_start_time
+        remaining = max(0, AUTO_RECOVERY_TIME - elapsed)
+        print(f"\nATTACK IN PROGRESS:")
+        print(f"  Duration: {int(elapsed)} seconds")
+        print(f"  Auto-recovery in: {int(remaining)} seconds")
+    
+    print("="*60)
+
+def test_all_attacks():
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Testing ALL Smart Grid Attack Types...")
+    
+    attacks = [
+        ("ICMP Flood Attack", "GRID1"),
+        ("SYN Flood Attack", "GRID2"),
+        ("UDP Flood Attack", "GRID1"),
+        ("Port Scan Attack", "GRID2"),
+        ("Brute Force Attack", "GRID1"),
+        ("Industrial Protocol Attack", "GRID2"),
+        ("DDoS Attack", "GRID1")
+    ]
+    
+    for attack_name, target in attacks:
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Testing: {attack_name} on {target}")
+        set_attack_mode(target, attack_name)
+        time.sleep(2)
+        set_normal_mode()
+        time.sleep(1)
+    
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] All attack tests completed!")
+    print("System returned to NORMAL mode")
+
+# ===== MAIN =====
+if __name__ == "__main__":
+    print("\n" + "="*100)
+    print("                   SMART GRID CYBER ATTACK PROTECTION SYSTEM")
+    print("                   AI-Powered Industrial Control System Security")
+    print("="*100)
+    print(f"Control Unit: Arduino @ {ARDUINO_IP}:{ARDUINO_PORT}")
+    print(f"Smart Grid 1: {GRID_IPS['GRID1']} (Industrial Control Node)")
+    print(f"Smart Grid 2: {GRID_IPS['GRID2']} (Power Distribution Node)")
+    
+    print(f"\nPROTECTION FEATURES:")
+    print("  • 7 Types of Cyber Attack Detection")
+    print("  • Industrial Protocol Monitoring (MODBUS, DNP3, IEC 60870)")
+    print("  • Targeted Grid Isolation during attacks")
+    print("  • Physical Safety Activation (Fans OFF, Alarms ON)")
+    print("  • Auto-recovery after {AUTO_RECOVERY_TIME} seconds")
+    
+    print(f"\nMONITORING PORTS:")
+    ports_list = ", ".join(str(p) for p in sorted(GRID_PORTS))
+    print(f"  Industrial: {ports_list}")
+    
+    print("="*100)
+    
+    # Test Arduino connection
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    print(f"\n[{timestamp}] Testing control unit connection...")
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        sock.connect((ARDUINO_IP, ARDUINO_PORT))
+        sock.close()
+        print(f"[{timestamp}] Control Unit: ONLINE ✓")
+    except:
+        print(f"[{timestamp}] Control Unit: OFFLINE ✗")
+    
+    # Start in NORMAL mode
+    set_normal_mode()
+    
+    # Start main menu
+    main_menu()

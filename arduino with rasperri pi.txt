@@ -1,0 +1,334 @@
+// ========== ARDUINO MASTER CONTROLLER ==========
+// COMPLETE FIXED VERSION - ALL ISSUES RESOLVED
+
+#include <SPI.h>
+#include <Ethernet.h>
+
+// NETWORK SETUP
+byte mac[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x00};
+IPAddress ip(192, 168, 1, 200);
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
+IPAddress dns(8, 8, 8, 8);
+
+// ESP32 IPs
+IPAddress esp1(192, 168, 1, 10);
+IPAddress esp2(192, 168, 1, 20);
+
+// Raspberry Pi Port
+const int PI_PORT = 5006;
+
+// Server for Raspberry Pi
+EthernetServer piServer(PI_PORT);
+
+// Connection tracking
+unsigned long lastKeepAlive = 0;
+const unsigned long KEEP_ALIVE_INTERVAL = 15000;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("=== ARDUINO MASTER CONTROLLER ===");
+  Serial.println("Automated - Raspberry Pi Controlled");
+  Serial.println("Commands: N, F, A, A1, A2");
+  
+  // Initialize Ethernet
+  Ethernet.init(10);
+  
+  // Start Ethernet
+  Ethernet.begin(mac, ip, dns, gateway, subnet);
+  delay(2000);
+  
+  Serial.print("My IP: ");
+  Serial.println(Ethernet.localIP());
+  Serial.print("Pi Server Port: ");
+  Serial.println(PI_PORT);
+  Serial.print("Link: ");
+  Serial.println(Ethernet.linkStatus() == LinkON ? "UP" : "DOWN");
+  
+  // Start Pi server
+  piServer.begin();
+  
+  delay(3000);
+  
+  // Start fans on boot (Normal mode)
+  Serial.println("Starting system in NORMAL mode...");
+  sendToESP(esp1, 'N');
+  sendToESP(esp2, 'N');
+  
+  lastKeepAlive = millis();
+}
+
+void loop() {
+  // 1. Check for Raspberry Pi commands
+  handlePiCommands();
+  
+  // 2. Periodically send keep-alive packets
+  if (millis() - lastKeepAlive > KEEP_ALIVE_INTERVAL) {
+    maintainConnection();
+    lastKeepAlive = millis();
+  }
+  
+  // 3. Optional: Serial commands for debugging
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    processManualCommand(cmd);
+  }
+  
+  delay(50);
+}
+
+// ===== RASPBERRY PI COMMAND HANDLER =====
+void handlePiCommands() {
+  EthernetClient piClient = piServer.available();
+  
+  if (piClient) {
+    Serial.println("Raspberry Pi connected!");
+    
+    // Read command from Pi
+    if (piClient.available()) {
+      char command = piClient.read();
+      char secondChar = '\0';
+      
+      // Check if there's a second character
+      if (piClient.available()) {
+        secondChar = piClient.read();
+      }
+      
+      // Process Pi command
+      processPiCommand(command, secondChar);
+      
+      // Send acknowledgment to Pi
+      piClient.print("ACK:");
+      piClient.print(command);
+      if (secondChar != '\0') {
+        piClient.print(secondChar);
+      }
+      piClient.println();
+    }
+    
+    piClient.stop();
+    Serial.println("Pi disconnected");
+  }
+}
+
+void processPiCommand(char cmd, char secondChar) {
+  switch(cmd) {
+    case 'N':  // Normal mode from Pi
+      Serial.println(">>> NORMAL MODE (From Pi)");
+      sendToESP(esp1, 'N');
+      sendToESP(esp2, 'N');
+      break;
+      
+    case 'F':  // Standby mode from Pi
+      Serial.println(">>> STANDBY MODE (From Pi)");
+      sendToESP(esp1, 'F');
+      sendToESP(esp2, 'F');
+      break;
+      
+    case 'A':  // Attack alert from Pi
+      if (secondChar == '1') {
+        Serial.println("!!! ATTACK MODE - GRID 1 ONLY (From Pi)!!!");
+        sendToESP(esp1, 'A');  // Attack Grid 1
+        sendToESP(esp2, 'N');  // Keep Grid 2 normal
+      } else if (secondChar == '2') {
+        Serial.println("!!! ATTACK MODE - GRID 2 ONLY (From Pi)!!!");
+        sendToESP(esp1, 'N');  // Keep Grid 1 normal
+        sendToESP(esp2, 'A');  // Attack Grid 2
+      } else {
+        Serial.println("!!! ATTACK MODE - BOTH GRIDS (From Pi)!!!");
+        sendToESP(esp1, 'A');
+        sendToESP(esp2, 'A');
+      }
+      break;
+      
+    default:
+      Serial.print("Unknown Pi command: ");
+      Serial.println(cmd);
+      break;
+  }
+}
+
+// ===== MANUAL COMMANDS (For Debugging) =====
+void processManualCommand(char cmd) {
+  switch(cmd) {
+    case 'N': case 'n':
+      Serial.println(">>> NORMAL MODE (Manual)");
+      sendToESP(esp1, 'N');
+      sendToESP(esp2, 'N');
+      break;
+      
+    case 'F': case 'f':
+      Serial.println(">>> STANDBY MODE (Manual)");
+      sendToESP(esp1, 'F');
+      sendToESP(esp2, 'F');
+      break;
+      
+    case 'A': case 'a':
+      Serial.println("!!! ATTACK MODE - BOTH GRIDS (Manual)!!!");
+      sendToESP(esp1, 'A');
+      sendToESP(esp2, 'A');
+      break;
+      
+    case '1':
+      Serial.println("!!! ATTACK MODE - GRID 1 ONLY (Manual)!!!");
+      sendToESP(esp1, 'A');
+      sendToESP(esp2, 'N');
+      break;
+      
+    case '2':
+      Serial.println("!!! ATTACK MODE - GRID 2 ONLY (Manual)!!!");
+      sendToESP(esp1, 'N');
+      sendToESP(esp2, 'A');
+      break;
+      
+    case 'S': case 's':
+      showStatus();
+      break;
+      
+    case 'T': case 't':
+      testSequence();
+      break;
+  }
+}
+
+// ===== ESP32 COMMUNICATION =====
+void sendToESP(IPAddress target, char command) {
+  EthernetClient client;
+  int maxRetries = 2;
+  
+  for (int attempt = 0; attempt < maxRetries; attempt++) {
+    if (client.connect(target, 5005)) {
+      client.write(command);
+      delay(10);
+      
+      unsigned long start = millis();
+      while (client.connected() && millis() - start < 500) {
+        if (client.available()) {
+          String response = client.readString();
+          Serial.print("ESP Response: ");
+          Serial.println(response);
+          break;
+        }
+        delay(1);
+      }
+      
+      client.stop();
+      
+      Serial.print("Sent '");
+      Serial.print(command);
+      Serial.print("' to ");
+      Serial.print(target);
+      Serial.print(" (attempt ");
+      Serial.print(attempt + 1);
+      Serial.println(")");
+      return;
+    }
+    
+    if (attempt < maxRetries - 1) {
+      Serial.print("Connection to ");
+      Serial.print(target);
+      Serial.println(" failed, retrying...");
+      delay(500);
+    }
+  }
+  
+  Serial.print("Failed to send to ");
+  Serial.println(target);
+}
+
+void maintainConnection() {
+  static int counter = 0;
+  counter++;
+  
+  Serial.print("Keep-alive #");
+  Serial.print(counter);
+  Serial.print(" - ");
+  
+  bool esp1_ok = pingESP(esp1);
+  bool esp2_ok = pingESP(esp2);
+  
+  Serial.print("ESP1: ");
+  Serial.print(esp1_ok ? "OK" : "FAIL");
+  Serial.print(", ESP2: ");
+  Serial.println(esp2_ok ? "OK" : "FAIL");
+  
+  if (!esp1_ok && !esp2_ok) {
+    Serial.println("Both ESP32s offline, checking link...");
+    if (Ethernet.linkStatus() != LinkON) {
+      Serial.println("Link down, attempting reset...");
+      resetConnections();
+    }
+  }
+}
+
+bool pingESP(IPAddress target) {
+  EthernetClient client;
+  
+  if (client.connect(target, 5005)) {
+    client.write('?');
+    delay(5);
+    client.stop();
+    return true;
+  }
+  return false;
+}
+
+void showStatus() {
+  Serial.println("\n=== SYSTEM STATUS ===");
+  Serial.print("Arduino IP: ");
+  Serial.println(Ethernet.localIP());
+  
+  Serial.print("Link status: ");
+  switch(Ethernet.linkStatus()) {
+    case Unknown: Serial.println("Unknown"); break;
+    case LinkON: Serial.println("UP"); break;
+    case LinkOFF: Serial.println("DOWN"); break;
+  }
+  
+  Serial.print("ESP1: ");
+  Serial.print(pingESP(esp1) ? "Online" : "Offline");
+  Serial.print(" | ESP2: ");
+  Serial.println(pingESP(esp2) ? "Online" : "Offline");
+  
+  Serial.println("====================");
+}
+
+void resetConnections() {
+  Serial.println("Resetting Ethernet connection...");
+  Ethernet.begin(mac, ip, dns, gateway, subnet);
+  delay(3000);
+  Serial.print("New IP: ");
+  Serial.println(Ethernet.localIP());
+}
+
+void testSequence() {
+  Serial.println("=== TEST SEQUENCE ===");
+  
+  Serial.println("1. Normal mode...");
+  sendToESP(esp1, 'N');
+  sendToESP(esp2, 'N');
+  delay(2000);
+  
+  Serial.println("2. Attack Grid 1 only...");
+  sendToESP(esp1, 'A');
+  sendToESP(esp2, 'N');
+  delay(2000);
+  
+  Serial.println("3. Attack Grid 2 only...");
+  sendToESP(esp1, 'N');
+  sendToESP(esp2, 'A');
+  delay(2000);
+  
+  Serial.println("4. Attack both grids...");
+  sendToESP(esp1, 'A');
+  sendToESP(esp2, 'A');
+  delay(2000);
+  
+  Serial.println("5. Return to Normal...");
+  sendToESP(esp1, 'N');
+  sendToESP(esp2, 'N');
+  
+  Serial.println("Test complete");
+}

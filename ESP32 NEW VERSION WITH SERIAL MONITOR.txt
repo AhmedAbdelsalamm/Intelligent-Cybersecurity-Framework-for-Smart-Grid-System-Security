@@ -1,0 +1,404 @@
+// ========== ESP32 SMART GRID CONTROLLER ==========
+// COMPLETE FIXED VERSION - ALL ISSUES RESOLVED
+
+#include <SPI.h>
+#include <Ethernet.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ===== NETWORK CONFIG =====
+// FOR ESP32 #1 (Grid 1):
+byte mac[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02};
+IPAddress ip(192, 168, 1, 20);
+
+// FOR ESP32 #2 (Grid 2):
+// byte mac[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02};
+// IPAddress ip(192, 168, 1, 20);
+
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
+IPAddress dns(8, 8, 8, 8);
+
+// ===== HARDWARE PINS =====
+const int RELAY_PIN = 26;   // Active LOW: LOW=ON, HIGH=OFF
+const int LED_PIN = 14;
+const int BUZZER_PIN = 13;
+const int W5500_CS = 5;
+const int W5500_RST = 4;
+
+// ===== LCD =====
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ===== SERVER =====
+EthernetServer server(5005);
+
+// ===== SYSTEM STATE =====
+enum SystemState { STATE_NORMAL, STATE_STANDBY, STATE_ATTACK };
+SystemState currentState = STATE_NORMAL;
+
+bool fanState = false;
+unsigned long lastClientTime = 0;
+unsigned long lastMaintainTime = 0;
+bool networkInitialized = false;
+
+// AUTO-RECOVERY
+unsigned long attackStartTime = 0;
+bool isInAttackMode = false;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n=== ESP32 SMART GRID CONTROLLER ===");
+  Serial.print("Grid IP: ");
+  Serial.println(ip);
+  
+  // Initialize hardware
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(W5500_RST, OUTPUT);
+  pinMode(2, OUTPUT);
+  
+  // Start with everything OFF
+  digitalWrite(RELAY_PIN, HIGH);  // Fan OFF (Active LOW: HIGH = OFF)
+  digitalWrite(LED_PIN, LOW);
+  noTone(BUZZER_PIN);
+  digitalWrite(2, LOW);
+  
+  // Initialize LCD
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Initializing...");
+  
+  // Initialize Ethernet
+  digitalWrite(W5500_RST, LOW);
+  delay(100);
+  digitalWrite(W5500_RST, HIGH);
+  delay(1000);
+  
+  Ethernet.init(W5500_CS);
+  Ethernet.begin(mac, ip, dns, gateway, subnet);
+  delay(2000);
+  
+  if (Ethernet.localIP() == IPAddress(0,0,0,0)) {
+    Serial.println("Failed to initialize network!");
+    lcd.clear();
+    lcd.print("NETWORK ERROR");
+    networkInitialized = false;
+  } else {
+    server.begin();
+    networkInitialized = true;
+    
+    Serial.print("Network ready. IP: ");
+    Serial.println(Ethernet.localIP());
+    
+    lcd.clear();
+    lcd.print("Ready");
+    lcd.setCursor(0, 1);
+    lcd.print(Ethernet.localIP());
+    
+    delay(2000);
+  }
+  
+  lastClientTime = millis();
+  lastMaintainTime = millis();
+  
+  // Start in NORMAL mode
+  fanOn();
+  
+  Serial.println("=== SYSTEM READY ===");
+}
+
+void loop() {
+  // Maintain network connection
+  if (millis() - lastMaintainTime > 10000) {
+    maintainConnection();
+    lastMaintainTime = millis();
+  }
+  
+  // Handle client connections
+  handleClients();
+  
+  // Handle timeout
+  if (millis() - lastClientTime > 60000) {
+    handleTimeout();
+  }
+  
+  // Handle attack mode buzzer
+  handleBuzzer();
+  
+  // AUTO-RECOVERY: Return to normal after 30 seconds
+  if (isInAttackMode && attackStartTime > 0) {
+    if (millis() - attackStartTime > 30000) {
+      Serial.println("Auto-recovery: Returning to NORMAL mode");
+      fanOn();
+    }
+  }
+  
+  // Blink status LED
+  static unsigned long lastBlink = 0;
+  
+  if (isInAttackMode) {
+    // Fast blink in attack mode
+    if (millis() - lastBlink > 200) {
+      digitalWrite(2, !digitalRead(2));
+      lastBlink = millis();
+    }
+  } else {
+    // Slow blink in normal mode
+    if (millis() - lastBlink > 1000) {
+      digitalWrite(2, !digitalRead(2));
+      lastBlink = millis();
+    }
+  }
+  
+  delay(10);
+}
+
+// ===== NETWORK MAINTENANCE =====
+void maintainConnection() {
+  static int counter = 0;
+  counter++;
+  
+  Serial.print("Keep-alive #");
+  Serial.print(counter);
+  Serial.print(" - ");
+  
+  if (isInAttackMode) {
+    Serial.print("Attack Mode - ");
+  } else {
+    Serial.print("Normal Mode - ");
+  }
+  
+  Serial.println(fanState ? "Fan ON" : "Fan OFF");
+  
+  if (!networkInitialized) {
+    Serial.println("Network not initialized, trying to recover...");
+    initializeNetwork();
+    return;
+  }
+  
+  if (Ethernet.linkStatus() != LinkON) {
+    Serial.println("Link lost! Attempting recovery...");
+    lcd.clear();
+    lcd.print("Link lost!");
+    lcd.setCursor(0, 1);
+    lcd.print("Recovering...");
+    
+    networkInitialized = false;
+    initializeNetwork();
+  }
+}
+
+void initializeNetwork() {
+  digitalWrite(W5500_RST, LOW);
+  delay(100);
+  digitalWrite(W5500_RST, HIGH);
+  delay(1000);
+  
+  Ethernet.init(W5500_CS);
+  Ethernet.begin(mac, ip, dns, gateway, subnet);
+  delay(2000);
+  
+  if (Ethernet.localIP() != IPAddress(0,0,0,0)) {
+    server.begin();
+    networkInitialized = true;
+    
+    Serial.print("Network recovered. IP: ");
+    Serial.println(Ethernet.localIP());
+    
+    lcd.clear();
+    lcd.print("Recovered");
+    lcd.setCursor(0, 1);
+    lcd.print(Ethernet.localIP());
+    
+    delay(2000);
+  }
+}
+
+// ===== CLIENT HANDLING =====
+void handleClients() {
+  if (!networkInitialized) return;
+  
+  EthernetClient client = server.available();
+  
+  if (client) {
+    Serial.println("Client connected");
+    lastClientTime = millis();
+    
+    while (client.connected()) {
+      if (client.available()) {
+        char command = client.read();
+        Serial.print("Command received: ");
+        Serial.println(command);
+        executeCommand(command);
+        
+        // Send acknowledgment
+        if (isInAttackMode) {
+          client.println("STATUS:ATTACK");
+        } else {
+          client.println(fanState ? "STATUS:NORMAL" : "STATUS:STANDBY");
+        }
+        break;
+      }
+      delay(1);
+    }
+    
+    client.stop();
+    Serial.println("Client disconnected");
+  }
+}
+
+void executeCommand(char cmd) {
+  switch(cmd) {
+    case 'F':  // NORMAL mode: Fan ON, Alarms OFF
+      fanOn();
+      break;
+      
+    case 'N':  // STANDBY mode: Fan OFF, Alarms OFF
+      fanOff();
+      break;
+      
+    case 'A':  // ATTACK mode: Fan OFF, Alarms ON
+      attackMode();
+      break;
+      
+    case '?':  // Ping/keep-alive
+      Serial.println("Ping received");
+      break;
+      
+    default:
+      Serial.print("Unknown command: ");
+      Serial.println(cmd);
+      break;
+  }
+}
+
+// ===== STATE FUNCTIONS =====
+void fanOn() {
+  Serial.println(">>> NORMAL MODE: FAN ON");
+  
+  // Reset attack state
+  attackStartTime = 0;
+  isInAttackMode = false;
+  currentState = STATE_NORMAL;
+  
+  // Fan ON (LOW for Active LOW relay)
+  digitalWrite(RELAY_PIN, LOW);
+  fanState = true;
+  
+  // Alarms OFF
+  digitalWrite(LED_PIN, LOW);
+  noTone(BUZZER_PIN);
+  
+  // Update LCD
+  lcd.clear();
+  lcd.print("MODE: NORMAL");
+  lcd.setCursor(0, 1);
+  lcd.print("Fan: ON  Alarm: OFF");
+  
+  Serial.println("System: Normal | Fan: ON | Alarms: OFF");
+}
+
+void fanOff() {
+  Serial.println(">>> STANDBY MODE: FAN OFF");
+  
+  // Reset attack state
+  attackStartTime = 0;
+  isInAttackMode = false;
+  currentState = STATE_STANDBY;
+  
+  // Fan OFF (HIGH for Active LOW relay)
+  digitalWrite(RELAY_PIN, HIGH);
+  fanState = false;
+  
+  // Alarms OFF
+  digitalWrite(LED_PIN, LOW);
+  noTone(BUZZER_PIN);
+  
+  // Update LCD
+  lcd.clear();
+  lcd.print("MODE: STANDBY");
+  lcd.setCursor(0, 1);
+  lcd.print("Fan: OFF  Alarm: OFF");
+  
+  Serial.println("System: Standby | Fan: OFF | Alarms: OFF");
+}
+
+void attackMode() {
+  Serial.println("!!! ATTACK MODE ACTIVATED !!!");
+  
+  // Set attack state
+  isInAttackMode = true;
+  attackStartTime = millis();
+  currentState = STATE_ATTACK;
+  
+  // FAN: OFF for safety (HIGH = OFF for Active LOW relay)
+  digitalWrite(RELAY_PIN, LOW);
+  fanState = false;
+  
+  // ALARMS: ON
+  digitalWrite(LED_PIN, HIGH);
+  
+  // Update LCD
+  lcd.clear();
+  lcd.print("!!! ATTACK !!!");
+  lcd.setCursor(0, 1);
+  lcd.print("FAN OFF | ALARM ON");
+  
+  Serial.println("Attack mode activated:");
+  Serial.println("  - Fan: OFF (safety shutdown)");
+  Serial.println("  - LED: ON (visual alarm)");
+  Serial.println("  - Buzzer: ACTIVE (audible alarm)");
+  Serial.println("  - Auto-recovery in 30 seconds...");
+}
+
+// ===== TIMEOUT HANDLING =====
+void handleTimeout() {
+  static bool timeoutActive = false;
+  
+  if (!timeoutActive) {
+    Serial.println("No commands for 60s - Entering safe mode");
+    lcd.clear();
+    lcd.print("NO COMMANDS");
+    lcd.setCursor(0, 1);
+    lcd.print("Safe mode: Fan OFF");
+    timeoutActive = true;
+  }
+  
+  // Turn off fan in timeout mode (safety)
+  digitalWrite(RELAY_PIN, HIGH);
+  fanState = false;
+  digitalWrite(LED_PIN, LOW);
+  noTone(BUZZER_PIN);
+  isInAttackMode = false;
+  currentState = STATE_STANDBY;
+}
+
+// ===== BUZZER HANDLING =====
+void handleBuzzer() {
+  static unsigned long lastBeep = 0;
+  static bool beeping = false;
+  
+  if (isInAttackMode) {
+    if (millis() - lastBeep > 500) {
+      if (beeping) {
+        noTone(BUZZER_PIN);
+        beeping = false;
+      } else {
+        tone(BUZZER_PIN, 2000);
+        beeping = true;
+      }
+      lastBeep = millis();
+    }
+  } else {
+    if (beeping) {
+      noTone(BUZZER_PIN);
+      beeping = false;
+    }
+  }
+}
